@@ -1,4 +1,25 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
+
+// ─── Supabase Edge Function URL ────────────────────────────────────────────────
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+async function runScan({ contentType, title, imageUrl, originalUrl }) {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/scan-content`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    },
+    body: JSON.stringify({ contentType, title, imageUrl, originalUrl }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Scan failed (${res.status})`);
+  }
+  return res.json();
+}
 
 // ─── Company Profile ───────────────────────────────────────────────────────────
 const COMPANY_PROFILE = {
@@ -31,50 +52,6 @@ const PLATFORMS = [
   "Metalocus", "Instagram", "LinkedIn", "Vimeo", "YouTube",
   "Pinterest", "Google Images", "Houzz", "Behance", "e-flux", "Azure Magazine",
 ];
-
-// ─── Mock Data Generator ───────────────────────────────────────────────────────
-function seededRand(seed) {
-  const x = Math.sin(seed) * 10000;
-  return x - Math.floor(x);
-}
-
-function generateScanResults(contentId, title, seed = 0) {
-  const count = Math.floor(seededRand(seed) * 5) + 2;
-  const results = [];
-  const used = new Set();
-  for (let i = 0; i < count; i++) {
-    let pidx;
-    do { pidx = Math.floor(seededRand(seed + i * 7 + 1) * PLATFORMS.length); }
-    while (used.has(pidx));
-    used.add(pidx);
-
-    const daysAgo = Math.floor(seededRand(seed + i * 3) * 90) + 1;
-    const d = new Date("2026-05-06");
-    d.setDate(d.getDate() - daysAgo);
-
-    const statusR = seededRand(seed + i * 11);
-    let status;
-    if (statusR < 0.2) status = "Original";
-    else if (statusR < 0.45) status = "Reposted";
-    else if (statusR < 0.70) status = "Cited";
-    else status = "Uncredited";
-
-    const sentR = seededRand(seed + i * 5);
-    const sentiment = sentR < 0.55 ? "Positive" : sentR < 0.80 ? "Neutral" : "Negative";
-    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
-    const domain = PLATFORMS[pidx].toLowerCase().replace(/[^a-z0-9]/g, "");
-
-    results.push({
-      id: `${contentId}-${i}`,
-      platform: PLATFORMS[pidx],
-      url: `https://${domain}.com/articles/${slug}`,
-      dateDetected: d.toISOString().split("T")[0],
-      sentiment,
-      status,
-    });
-  }
-  return results;
-}
 
 // ─── Pre-seeded Initial Content ───────────────────────────────────────────────
 const INITIAL_CONTENT = [
@@ -225,22 +202,40 @@ function StatCard({ label, value, accent, danger }) {
 }
 
 function AddContentForm({ onAdd, onCancel }) {
-  const [form, setForm] = useState({ title: "", type: "Article", url: "", publishedDate: "", tags: "" });
+  const [form, setForm] = useState({ title: "", type: "Article", url: "", imageUrl: "", publishedDate: "", tags: "" });
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState(null);
   const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
-  const valid = form.title.trim() && form.url.trim();
+  const needsImage = form.type === "Photo" || form.type === "Video";
+  const valid = form.title.trim() && form.url.trim() && (!needsImage || form.imageUrl.trim());
 
-  const handle = () => {
-    if (!valid) return;
-    const id = `u${Date.now()}`;
-    onAdd({
-      id,
-      title: form.title.trim(),
-      type: form.type,
-      url: form.url.trim(),
-      publishedDate: form.publishedDate || new Date().toISOString().split("T")[0],
-      tags: form.tags.split(",").map((t) => t.trim()).filter(Boolean),
-      scanResults: generateScanResults(id, form.title, Date.now() % 1000),
-    });
+  const handle = async () => {
+    if (!valid || scanning) return;
+    setScanning(true);
+    setError(null);
+    try {
+      const id = `u${Date.now()}`;
+      const scanResults = await runScan({
+        contentType: form.type,
+        title: form.title.trim(),
+        imageUrl: form.imageUrl.trim() || null,
+        originalUrl: form.url.trim(),
+      });
+      onAdd({
+        id,
+        title: form.title.trim(),
+        type: form.type,
+        url: form.url.trim(),
+        imageUrl: form.imageUrl.trim() || null,
+        publishedDate: form.publishedDate || new Date().toISOString().split("T")[0],
+        tags: form.tags.split(",").map((t) => t.trim()).filter(Boolean),
+        scanResults,
+      });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setScanning(false);
+    }
   };
 
   const inp = "w-full border border-stone-300 bg-white px-3 py-2 text-sm font-mono focus:outline-none focus:border-stone-950 transition-colors";
@@ -268,17 +263,28 @@ function AddContentForm({ onAdd, onCancel }) {
           <label className={lbl}>Original URL *</label>
           <input className={inp} placeholder="https://plane-site.com/projects/…" value={form.url} onChange={set("url")} />
         </div>
+        {needsImage && (
+          <div className="col-span-2">
+            <label className={lbl}>Image URL * <span className="normal-case">(public URL of the image file for reverse search)</span></label>
+            <input className={inp} placeholder="https://plane-site.com/images/photo.jpg" value={form.imageUrl} onChange={set("imageUrl")} />
+          </div>
+        )}
         <div className="col-span-2">
           <label className={lbl}>Tags (comma-separated)</label>
           <input className={inp} placeholder="architecture, MVRDV, Berlin" value={form.tags} onChange={set("tags")} />
         </div>
       </div>
+      {error && (
+        <div className="mt-4 px-4 py-3 bg-red-50 border border-red-200 text-xs text-red-700 font-mono">
+          ✕ {error}
+        </div>
+      )}
       <div className="flex gap-3 mt-5">
-        <button onClick={handle} disabled={!valid}
-          className={`px-6 py-2 text-xs uppercase tracking-widest font-mono transition-colors ${valid ? "bg-stone-950 text-white hover:bg-stone-700" : "bg-stone-200 text-stone-400 cursor-not-allowed"}`}>
-          Run Scan & Track
+        <button onClick={handle} disabled={!valid || scanning}
+          className={`px-6 py-2 text-xs uppercase tracking-widest font-mono transition-colors ${valid && !scanning ? "bg-stone-950 text-white hover:bg-stone-700" : "bg-stone-200 text-stone-400 cursor-not-allowed"}`}>
+          {scanning ? "Scanning…" : "Run Scan & Track"}
         </button>
-        <button onClick={onCancel} className="border border-stone-300 px-6 py-2 text-xs uppercase tracking-widest font-mono hover:bg-stone-50 transition-colors">
+        <button onClick={onCancel} disabled={scanning} className="border border-stone-300 px-6 py-2 text-xs uppercase tracking-widest font-mono hover:bg-stone-50 transition-colors disabled:opacity-50">
           Cancel
         </button>
       </div>
@@ -299,9 +305,30 @@ function ScanResultRow({ result }) {
   );
 }
 
-function ContentCard({ content, isOpen, onToggle }) {
+function ContentCard({ content, isOpen, onToggle, onRescan }) {
+  const [rescanning, setRescanning] = useState(false);
+  const [rescanError, setRescanError] = useState(null);
   const uncredited = content.scanResults.filter((r) => r.status === "Uncredited").length;
   const byStatus = STATUSES.reduce((acc, s) => ({ ...acc, [s]: content.scanResults.filter((r) => r.status === s).length }), {});
+
+  const handleRescan = async (e) => {
+    e.stopPropagation();
+    setRescanning(true);
+    setRescanError(null);
+    try {
+      const results = await runScan({
+        contentType: content.type,
+        title: content.title,
+        imageUrl: content.imageUrl || null,
+        originalUrl: content.url,
+      });
+      onRescan(content.id, results);
+    } catch (err) {
+      setRescanError(err.message);
+    } finally {
+      setRescanning(false);
+    }
+  };
 
   return (
     <div className={`bg-white border transition-all ${isOpen ? "border-stone-950" : "border-stone-200 hover:border-stone-400"}`}>
@@ -346,12 +373,24 @@ function ContentCard({ content, isOpen, onToggle }) {
             <div className="text-xs uppercase tracking-widest text-stone-400 font-mono">
               {content.scanResults.length} detections · {new Set(content.scanResults.map((r) => r.platform)).size} platforms
             </div>
-            <div className="flex gap-2 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
               {STATUSES.map((s) => byStatus[s] > 0 && (
                 <span key={s} className={`text-xs px-2 py-0.5 font-mono ${statusStyle(s)}`}>{s}: {byStatus[s]}</span>
               ))}
+              <button
+                onClick={handleRescan}
+                disabled={rescanning}
+                className="text-xs px-3 py-0.5 font-mono border border-stone-300 hover:border-stone-950 hover:bg-stone-950 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {rescanning ? "Scanning…" : "↺ Rescan"}
+              </button>
             </div>
           </div>
+          {rescanError && (
+            <div className="px-5 py-2 bg-red-50 text-xs text-red-700 font-mono border-b border-red-200">
+              ✕ Rescan failed: {rescanError}
+            </div>
+          )}
           <div className="divide-y divide-stone-100">
             {content.scanResults
               .slice()
@@ -422,6 +461,14 @@ export default function App() {
     setToast(`"${content.title}" tracked — ${content.scanResults.length} detections found`);
     setTimeout(() => setToast(null), 4000);
   };
+
+  const handleRescan = useCallback((id, newResults) => {
+    setContents((prev) =>
+      prev.map((c) => c.id === id ? { ...c, scanResults: newResults } : c)
+    );
+    setToast(`Rescan complete — ${newResults.length} detections found`);
+    setTimeout(() => setToast(null), 4000);
+  }, []);
 
   return (
     <div className="min-h-screen bg-stone-50">
@@ -553,6 +600,7 @@ export default function App() {
                     content={c}
                     isOpen={openId === c.id}
                     onToggle={() => setOpenId(openId === c.id ? null : c.id)}
+                    onRescan={handleRescan}
                   />
                 ))
               )}

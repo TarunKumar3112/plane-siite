@@ -11,110 +11,143 @@ npm run preview   # preview the production build locally
 npm run lint      # run ESLint
 
 # Deploy Edge Functions after changes
-npx supabase functions deploy scan-content --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
-npx supabase functions deploy monitor-brand --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
+npx supabase functions deploy scan-content      --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
+npx supabase functions deploy monitor-brand     --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
+npx supabase functions deploy crawl-competitor  --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
+npx supabase functions deploy benchmark-report  --project-ref ekeetvpiranxffzqolaa --no-verify-jwt
 
-# Set Google API secrets (once user has keys)
-npx supabase secrets set GOOGLE_API_KEY=... GOOGLE_CSE_ID=... --project-ref ekeetvpiranxffzqolaa
+# Set secrets
+npx supabase secrets set GOOGLE_API_KEY=...    GOOGLE_CSE_ID=...    --project-ref ekeetvpiranxffzqolaa
+npx supabase secrets set FIRECRAWL_API_KEY=... ANTHROPIC_API_KEY=... --project-ref ekeetvpiranxffzqolaa
 ```
 
 No test suite is configured.
 
 ## Architecture
 
-This is a single-page React 19 + Vite 8 application styled entirely with Tailwind CSS v4 (loaded via `@tailwindcss/vite` plugin — no `tailwind.config.js` needed).
+Single-page React 19 + Vite 8 app, Tailwind CSS v4, no router, no external state library.
 
-**Everything lives in one file: `src/App.jsx`.** The app has no router and no external state library. Two modules are tab-switched inside the same App component.
+**Everything lives in one file: `src/App.jsx`.** Three modules tab-switched inside one `App` component.
 
-### Backend — Supabase Edge Functions
+### Backend — Supabase (ref: `ekeetvpiranxffzqolaa`, region: ap-south-1)
 
-All scan logic runs server-side to keep Google API keys out of the browser.
+#### Secrets (set in Supabase dashboard or CLI)
+| Secret | Used by |
+|---|---|
+| `GOOGLE_API_KEY` | Module 1 (Vision + Custom Search), Module 2 |
+| `GOOGLE_CSE_ID` | Module 1, Module 2 |
+| `FIRECRAWL_API_KEY` | Module 3 `crawl-competitor` — falls back to demo articles if absent |
+| `ANTHROPIC_API_KEY` | Module 3 `benchmark-report` — falls back to structural analysis if absent |
 
-- **Project:** `plane-site` on Supabase (ref: `ekeetvpiranxffzqolaa`, region: ap-south-1)
-- **Required secrets** (set via Supabase dashboard or CLI):
-  - `GOOGLE_API_KEY` — Google Cloud API key with Vision API + Custom Search API enabled
-  - `GOOGLE_CSE_ID` — Programmable Search Engine ID (web-wide search)
+#### Database (applied via `supabase/migrations/benchmark_tables.sql`)
+- `ps_competitors` — managed list of competitor sites (seeded with 7 architecture media outlets)
+- `ps_competitor_content` — articles crawled from competitors; `is_mock=true` when Firecrawl key absent
+- pgvector extension enabled for future embedding support
+- Both tables: RLS enabled, anon gets full access (single-tenant tool)
 
-#### Module 1: `supabase/functions/scan-content/index.ts`
-Deployed at `…/functions/v1/scan-content`. Tracks where specific published content appears.
-- `Photo` / `Video` → Google Vision API Web Detection (reverse image search)
-- `Article` / `Project` / `Press Release` → Google Custom Search API (exact title match)
-- Called via `runScan()` in `App.jsx`
+#### Edge Functions
 
-#### Module 2: `supabase/functions/monitor-brand/index.ts`
-Deployed at `…/functions/v1/monitor-brand`. Scans the web for brand mentions of PLANE—SITE.
-- Runs 5 query variants in parallel via `Promise.allSettled`: `"plane-site"`, `"plane—site"`, `"plane site" architecture`, `"plane_site"`, `"plane-site.com"`
-- Deduplicates by URL; skips the official domain
-- Classifies each result: category (Press/Social/Blog/Forum/News) and sentiment (Positive/Neutral/Negative)
-- Called via `runBrandScan()` in `App.jsx`
+**`supabase/functions/scan-content/index.ts`** — Module 1
+- Photo/Video → Google Vision API web detection
+- Article/Project/Press Release → Google Custom Search exact title match
+
+**`supabase/functions/monitor-brand/index.ts`** — Module 2
+- 5 query variants in parallel; deduplicates by URL; classifies category + sentiment
+
+**`supabase/functions/crawl-competitor/index.ts`** — Module 3
+- Input: `{ competitorId, competitorUrl, competitorName }`
+- If `FIRECRAWL_API_KEY`: scrapes via `POST https://api.firecrawl.dev/v1/scrape`, extracts article links + titles
+- If no key: inserts 12 realistic mock architecture articles (`is_mock=true`)
+- Upserts into `ps_competitor_content` (ignores duplicates by URL); updates `last_crawled_at`
+- Returns `{ articles, total, mode }` — mode is `"live"` or `"mock"`
+
+**`supabase/functions/benchmark-report/index.ts`** — Module 3
+- Input: `{ contentTitle, tags, contentType }`
+- Queries `ps_competitor_content` for rows whose `tags` array overlaps with the input tags
+- Scores each match by tag overlap count (`overlapScore`)
+- Computes `tagCoverage`: per-tag count of competitor matches + which competitors cover it
+- If `ANTHROPIC_API_KEY`: calls Claude Haiku with a benchmark prompt → strategic gap analysis
+- If no key: generates structural insight text from the coverage data
+- Returns `{ matches, tagCoverage, insight, insightMode, totalMatches }`
+
+### Supabase REST API (no SDK)
+
+App uses direct fetch calls — no `@supabase/supabase-js` dependency needed:
+
+```js
+// Helpers defined at module level in App.jsx:
+sbGet(path)               // GET /rest/v1/{path}
+sbPost(path, data, hdrs)  // POST /rest/v1/{path}
+sbDelete(path)            // DELETE /rest/v1/{path}
+
+// Edge function callers:
+runCrawlCompetitor({ competitorId, competitorUrl, competitorName })
+runBenchmarkReport({ contentTitle, tags, contentType })
+```
 
 ### Data model
-
-All state is managed in the root `App` component with `useState` and `useMemo`.
 
 #### Module 1 — Content items (`localStorage` key: `ps-content-v1`)
 ```js
 {
-  id: string,
-  title: string,
+  id: string, title: string,
   type: "Photo" | "Article" | "Project" | "Video" | "Press Release",
-  url: string,
-  imageUrl: string | null,    // required for Photo/Video — public URL of the image file
-  publishedDate: string,      // YYYY-MM-DD
-  tags: string[],
-  scanResults: ScanResult[],
-}
-```
-
-Each `ScanResult`:
-```js
-{
-  id: string,
-  platform: string,
-  url: string,
-  dateDetected: string,       // YYYY-MM-DD
-  sentiment: "Positive" | "Neutral" | "Negative",
-  status: "Original" | "Reposted" | "Cited" | "Uncredited",
+  url: string, imageUrl: string | null, publishedDate: string, tags: string[],
+  scanResults: [{ id, platform, url, dateDetected, sentiment, status }],
 }
 ```
 
 #### Module 2 — Brand mentions (`localStorage` key: `ps-brand-mentions-v1`)
 ```js
+{ id, query, platform, url, title, snippet, dateDetected, sentiment, category }
+```
+
+#### Module 3 — Competitors (Supabase `ps_competitors`)
+```js
+{ id: uuid, name, url, description, active, last_crawled_at, created_at }
+```
+
+#### Module 3 — Competitor content (Supabase `ps_competitor_content`)
+```js
+{ id: uuid, competitor_id: uuid, title, url, snippet, content_type, published_at, tags: string[], is_mock: bool, crawled_at }
+```
+
+#### Module 3 — Benchmark report (React state `benchmarkReport`, not persisted)
+```js
 {
-  id: string,
-  query: string,              // which search query found this result
-  platform: string,
-  url: string,
-  title: string,              // page title from Google search result
-  snippet: string,            // text excerpt from Google search result
-  dateDetected: string,       // YYYY-MM-DD
-  sentiment: "Positive" | "Neutral" | "Negative",
-  category: "Press" | "Social" | "Blog" | "Forum" | "News" | "Other",
+  matches: [{ ...ps_competitor_content row, ps_competitors: { name, url }, overlapScore }],
+  tagCoverage: { [tag]: { count: number, competitors: string[] } },
+  insight: string | null,    // Claude-generated or structural
+  insightMode: "claude" | "structural" | "none",
+  totalMatches: number,
 }
 ```
 
 ### Component structure (all in App.jsx)
 
-**Shared:**
-- `App` — root; owns all state for both modules; renders header with module tab nav, agency profile banner, then conditionally renders the active module
-- `StatCard` — small metric tile; supports `accent`, `danger`, `positive` props for color variants
+**Shared:** `App`, `StatCard`
 
-**Module 1 components:**
-- `AddContentForm` — async form; calls `runScan()` then `onAdd()` on submit; shows "Scanning…" state
-- `ContentCard` — accordion card per tracked content item; has "↺ Rescan" button that re-calls the Edge Function live
-- `ScanResultRow` — one row per detection inside an expanded `ContentCard`
-- `runScan()` — top-level async helper that POSTs to `scan-content` Edge Function
+**Module 1:** `AddContentForm`, `ContentCard`, `ScanResultRow` + `runScan()`
 
-**Module 2 components:**
-- `BrandMentionCard` — card showing title, quoted snippet, sentiment badge, category badge, platform, date, and originating search query
-- `runBrandScan()` — top-level async helper that POSTs to `monitor-brand` Edge Function
+**Module 2:** `BrandMentionCard` + `runBrandScan()`
+
+**Module 3:**
+- `CompetitorCard` — shows name, URL, article count, crawl date, "↓ Crawl" button, delete button
+- `AddCompetitorForm` — inline form for adding a new competitor
+- `BenchmarkMatchCard` — per-competitor article; highlights which of your tags overlap (emerald badges)
+- Two sub-views toggled by `m3View` state: `"competitors"` | `"benchmark"`
+- Competitors view: competitor grid + article preview panels per-competitor
+- Benchmark view: content selector → "Generate Report" → AI insight block + topic coverage matrix + match list + competitor breakdown sidebar
 
 ### Styling conventions
 
-- Stone palette (`stone-50` background, `stone-950` for primary dark/accent)
-- All UI text uses `font-mono` with `uppercase tracking-widest` for labels
-- Module 1 status badge colors: blue=Original, amber=Reposted, emerald=Cited, red=Uncredited
-- Module 2 sentiment badge colors: emerald=Positive, stone=Neutral, red=Negative
-- Module 2 category badge colors: violet=Press, sky=Social, orange=Blog, teal=Forum, indigo=News
-- No `App.css` custom classes — all styling is inline Tailwind utilities
-- Negative mentions sorted to top of list in Module 2
+- Stone palette (`stone-50` bg, `stone-950` accent)
+- All labels: `font-mono uppercase tracking-widest`
+- Module 1 status: blue=Original, amber=Reposted, emerald=Cited, red=Uncredited
+- Module 2 sentiment: emerald=Positive, stone=Neutral, red=Negative
+- Module 2 category: violet=Press, sky=Social, orange=Blog, teal=Forum, indigo=News
+- Module 3 overlap badge: emerald=High (≥3 tags), amber=Medium, stone=Low
+- Module 3 tag coverage: emerald=Gap (0), amber=Low (1–2), red=Well covered (≥3)
+- Module 3 AI insight block: stone-950 bg if Claude, amber bg if structural-only
+- No `App.css` — all styling is inline Tailwind utilities
+- Negative mentions sorted to top in Module 2; demo articles marked with amber "demo" badge in Module 3
